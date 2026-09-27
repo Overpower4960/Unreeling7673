@@ -11,7 +11,13 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const WORKER_PATH = process.env.WORKER_PATH || join(__dirname, "..", "xpanel", "Worker.js");
+const WORKER_PATH = (() => {
+  if (process.env.WORKER_PATH) return process.env.WORKER_PATH;
+  for (const c of [join(__dirname, "Worker.js"), join(__dirname, "..", "xpanel", "Worker.js")]) {
+    if (existsSync(c)) return c;
+  }
+  return join(__dirname, "Worker.js");
+})();
 const DB_PATH = process.env.SQLITE_PATH || join(__dirname, "data", "xpanel.db");
 const PORT = Number(process.env.PORT || 8080);
 
@@ -85,10 +91,60 @@ const env = {
 const worker = (await import(WORKER_PATH)).default;
 const ctx = { waitUntil: (p) => { try { Promise.resolve(p).catch(() => {}); } catch {} }, passThroughOnException: () => {} };
 
+// ── مسیرهای مدیریتی (انتقالِ داده از D1) ────────────────────────────────────
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+let migrating = false, lastMigration = null;
+async function runMigration() {
+  if (migrating) return { ok: false, error: "already running" };
+  migrating = true; const t0 = Date.now();
+  try {
+    const CF = process.env.CF_API_TOKEN, ACC = process.env.CF_ACCOUNT, D1 = process.env.CF_D1;
+    if (!CF || !ACC || !D1) return { ok: false, error: "CF_API_TOKEN/CF_ACCOUNT/CF_D1 لازم است" };
+    const d1 = async (sql) => {
+      const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${ACC}/d1/database/${D1}/query`, {
+        method: "POST", headers: { Authorization: `Bearer ${CF}`, "Content-Type": "application/json", "User-Agent": "xpanel-railway" },
+        body: JSON.stringify({ sql }),
+      });
+      const j = await r.json();
+      if (!j.success) throw new Error(JSON.stringify(j.errors || j).slice(0, 200));
+      return j.result[0].results;
+    };
+    sqlite.exec("CREATE TABLE IF NOT EXISTS store (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER)");
+    sqlite.exec("CREATE INDEX IF NOT EXISTS idx_store_exp ON store(expires_at)");
+    const up = sqlite.prepare("INSERT INTO store(key,value,expires_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at");
+    let last = 0, total = 0;
+    for (;;) {
+      const rows = await d1(`SELECT rowid AS r,key,value,expires_at FROM store WHERE rowid>${last} ORDER BY rowid LIMIT 2000`);
+      if (!rows.length) break;
+      sqlite.transaction((rs) => { for (const x of rs) up.run(x.key, x.value, x.expires_at); })(rows);
+      total += rows.length; last = rows[rows.length - 1].r;
+    }
+    const local = sqlite.prepare("SELECT count(*) n FROM store").get().n;
+    const remote = (await d1("SELECT count(*) n FROM store"))[0].n;
+    lastMigration = { at: new Date().toISOString(), copied: total, local, remote, ms: Date.now() - t0 };
+    return { ok: true, ...lastMigration };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e).slice(0, 300) };
+  } finally { migrating = false; }
+}
+
 // ── سرور HTTP ───────────────────────────────────────────────────────────────
 const server = createServer(async (req, res) => {
   try {
     const url = `http://${req.headers.host || "localhost"}${req.url}`;
+    const path = new URL(url).pathname;
+    if (path === "/admin/info" || path === "/admin/migrate") {
+      const tok = req.headers["x-admin-token"] || "";
+      if (!ADMIN_TOKEN || tok !== ADMIN_TOKEN) { res.statusCode = 403; return res.end(JSON.stringify({ ok: false, error: "forbidden" })); }
+      if (path === "/admin/info") {
+        const n = sqlite.prepare("SELECT count(*) n FROM store").get().n;
+        res.setHeader("Content-Type", "application/json");
+        return res.end(JSON.stringify({ ok: true, rows: n, dbPath: DB_PATH, lastMigration, cron: !process.env.SKIP_CRON }));
+      }
+      const r = await runMigration();
+      res.statusCode = r.ok ? 200 : 500; res.setHeader("Content-Type", "application/json");
+      return res.end(JSON.stringify(r));
+    }
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const body = chunks.length ? Buffer.concat(chunks) : undefined;
