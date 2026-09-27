@@ -237,6 +237,16 @@ export async function migrateFromD1() {
 // ── مسیرهای مدیریتی ────────────────────────────────────────────────────────
 function json(res, code, obj) { res.statusCode = code; res.setHeader("Content-Type", "application/json; charset=utf-8"); res.end(JSON.stringify(obj)); }
 async function readBody(req) { const chunks = []; for await (const c of req) chunks.push(c); return chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0); }
+// ── خواندن/نوشتنِ کلیدهای store با همان قالبِ بسته‌بندیِ ربات ({"data":…}) ──
+function storeGet(key) {
+  const r = db.prepare("SELECT value FROM store WHERE key=?").get(key);
+  if (!r) return null;
+  try { const o = JSON.parse(r.value); return (o && typeof o === "object" && "data" in o) ? o.data : o; } catch { return r.value; }
+}
+function storePut(key, value) {
+  db.prepare("INSERT INTO store(key,value,expires_at) VALUES(?,?,NULL) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+    .run(key, JSON.stringify({ data: value }));
+}
 
 // ── سرور ───────────────────────────────────────────────────────────────────
 const server = createServer(async (req, res) => {
@@ -272,6 +282,35 @@ const server = createServer(async (req, res) => {
         return json(res, 200, { ok: true, rows: rowCount() });
       }
       if (path === "/admin/reload") { await loadWorker(); return json(res, 200, { ok: true, note: "Worker.js دوباره بارگذاری شد" }); }
+      // ── کوئریِ مستقیم (جانشینِ کنسولِ D1 کلودفلر) — فقط SELECT/INSERT/UPDATE/DELETE ──
+      if (path === "/admin/sql") {
+        let body = {};
+        try { body = JSON.parse((await readBody(req)).toString() || "{}"); } catch {}
+        const sql = String(body.sql || "").trim();
+        const params = Array.isArray(body.params) ? body.params.map(san) : [];
+        if (!/^(SELECT|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql)) return json(res, 400, { ok: false, error: "فقط SELECT/INSERT/UPDATE/DELETE" });
+        try {
+          const st = db.prepare(sql);
+          const out = /^SELECT/i.test(sql) ? st.all(...params) : st.run(...params);
+          return json(res, 200, { ok: true, result: out });
+        } catch (e) { return json(res, 500, { ok: false, error: String(e.message || e) }); }
+      }
+      // ── ثبتِ وبهوکِ تلگرام روی همین دامنه (جانشینِ «نصب» روی کلودفلر) ──
+      if (path === "/admin/setwebhook") {
+        const q = new URL(url);
+        const origin = String(q.searchParams.get("url") || process.env.PUBLIC_URL || `https://${req.headers.host}`).replace(/\/+$/, "");
+        const botTok = storeGet("cfg:bot_token"), secret = storeGet("cfg:wh_secret");
+        if (!botTok) return json(res, 500, { ok: false, error: "cfg:bot_token در دیتابیس نیست" });
+        try {
+          const r = await fetch(`https://api.telegram.org/bot${botTok}/setWebhook`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: origin + "/webhook", allowed_updates: ["message", "callback_query", "channel_post", "edited_channel_post"], drop_pending_updates: false, ...(secret ? { secret_token: String(secret) } : {}) }),
+          });
+          const j = await r.json();
+          if (j.ok) { storePut("cfg:webhook_url", origin); storePut("cfg:webhook_initialized", "true"); if (secret) storePut("cfg:wh_secret_applied", secret); }
+          return json(res, j.ok ? 200 : 500, { ok: !!j.ok, url: origin + "/webhook", secret: secret ? "دارد" : "ندارد", telegram: j.description || "ok" });
+        } catch (e) { return json(res, 500, { ok: false, error: String(e.message || e) }); }
+      }
       return json(res, 404, { ok: false, error: "admin route?" });
     }
 
