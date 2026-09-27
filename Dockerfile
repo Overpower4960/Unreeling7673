@@ -20,8 +20,9 @@ ENV NODE_ENV=production \
     BACKUP_EVERY_H=6 \
     AUTO_RESTORE=1
 
+# ⚠️ خطِ VOLUME را عمداً نداریم: ریلوی «Docker VOLUME» را پشتیبانی نمی‌کند
+#    و والیومِ خودش را می‌خواهد (Settings → Volumes → Mount path = /data).
 RUN mkdir -p /data/backups
-VOLUME ["/data"]
 EXPOSE 8080
 
 # ریلوی خودش healthcheckPath را می‌زند؛ این برای اجرای دستی است
