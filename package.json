@@ -3,9 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "اجرای رباتِ xpanel روی Node/Railway — همان Worker.js با لایهٔ سازگاریِ D1⇒SQLite",
+  "description": "نسخهٔ ریلویِ رباتِ xpanel — همان Worker.js روی Node با SQLite (بدونِ سقفِ روزانهٔ D1)",
   "main": "server.mjs",
-  "scripts": { "start": "node server.mjs", "migrate": "node migrate.mjs" },
+  "scripts": {
+    "start": "node server.mjs",
+    "migrate": "node migrate.mjs"
+  },
   "engines": { "node": ">=20" },
   "dependencies": { "better-sqlite3": "^12.11.1" }
 }
