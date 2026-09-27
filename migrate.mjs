@@ -1,33 +1,31 @@
+#!/usr/bin/env node
 // ─────────────────────────────────────────────────────────────────────────────
-//  migrate.mjs — انتقالِ داده از D1 کلودفلر به SQLite محلی (ریلوی)
+//  migrate.mjs — انتقالِ دادهٔ D1 کلودفلر ⇒ SQLite (ریلوی/هرجا)
 //
-//  اجرا (یک‌بار، قبل از روشن‌کردنِ وبهوک به ریلوی):
-//    CF_API_TOKEN=... CF_ACCOUNT=... CF_D1=... node migrate.mjs
+//  استفاده:
+//    CF_API_TOKEN=… CF_ACCOUNT=… CF_D1=… SQLITE_PATH=./data/xpanel.db node migrate.mjs
 //
-//  • صفحه‌به‌صفحه (۲۰۰۰ ردیف) از D1 می‌خواند و در SQLite می‌نویسد
-//  • idempotent است: هر بار اجرا، ردیف‌ها را به‌روزرسانی می‌کند (upsert)
-//  • در پایان شمارشِ دو طرف را مقایسه می‌کند
+//  • خواندنی است (به D1 چیزی نمی‌نویسد) ⇒ سقفِ نوشتنِ کلودفلر را مصرف نمی‌کند.
+//  • قابلِ تکرار است (upsert) — اگر نیمه‌کاره ماند، دوباره اجرا کن.
+//  • در پایان تعداد ردیف‌های محلی و ریموت را مقایسه می‌کند.
 // ─────────────────────────────────────────────────────────────────────────────
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-const CF = process.env.CF_API_TOKEN;
-const ACC = process.env.CF_ACCOUNT || "03ca547457b14a68fc64908ee5ff8fcf";
-const D1 = process.env.CF_D1 || "7a5acc79-4157-4485-9f1b-fbe4dce329ba";
-const PATH = process.env.SQLITE_PATH || "/data/xpanel.db";
-if (!CF) { console.error("❌ CF_API_TOKEN لازم است"); process.exit(1); }
+const CF = process.env.CF_API_TOKEN, ACC = process.env.CF_ACCOUNT, D1 = process.env.CF_D1;
+const DB_PATH = process.env.SQLITE_PATH || "./data/xpanel.db";
+if (!CF || !ACC || !D1) { console.error("❌ CF_API_TOKEN / CF_ACCOUNT / CF_D1 لازم است"); process.exit(1); }
 
-mkdirSync(dirname(PATH), { recursive: true });
-const db = new Database(PATH);
+mkdirSync(dirname(DB_PATH), { recursive: true });
+const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 db.exec("CREATE TABLE IF NOT EXISTS store (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_store_exp ON store(expires_at)");
 
 async function d1(sql) {
   const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${ACC}/d1/database/${D1}/query`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${CF}`, "Content-Type": "application/json", "User-Agent": "xpanel-railway-migrate" },
+    headers: { Authorization: "Bearer " + CF, "Content-Type": "application/json", "User-Agent": "xpanel-migrate" },
     body: JSON.stringify({ sql }),
   });
   const j = await r.json();
@@ -35,17 +33,20 @@ async function d1(sql) {
   return j.result[0].results;
 }
 
-const upsert = db.prepare("INSERT INTO store(key,value,expires_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at");
+const up = db.prepare("INSERT INTO store(key,value,expires_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at");
+const remoteCount = (await d1("SELECT count(*) n FROM store"))[0].n;
+console.log(`📡 D1 ریموت: ${remoteCount.toLocaleString("en")} ردیف ⇒ ${DB_PATH}`);
+
 let last = 0, total = 0;
+const t0 = Date.now();
 for (;;) {
-  const rows = await d1(`SELECT rowid AS r,key,value,expires_at FROM store WHERE rowid>${last} ORDER BY rowid LIMIT 2000`);
+  const rows = await d1(`SELECT rowid AS r,key,value,expires_at FROM store WHERE rowid>${last} ORDER BY rowid LIMIT 200`);
   if (!rows.length) break;
-  const tx = db.transaction((rs) => { for (const x of rs) upsert.run(x.key, x.value, x.expires_at); });
-  tx(rows);
+  db.transaction((rs) => { for (const x of rs) up.run(x.key, x.value, x.expires_at); })(rows);
   total += rows.length; last = rows[rows.length - 1].r;
-  console.log(`   … ${total} ردیف`);
+  process.stdout.write(`\r   … ${total.toLocaleString("en")} ردیف`);
 }
 const local = db.prepare("SELECT count(*) n FROM store").get().n;
-const remote = (await d1("SELECT count(*) n FROM store"))[0].n;
-console.log(`── کل: محلی=${local} · کلودفلر=${remote} · ${local === remote ? "✅ یکسان" : "⚠️ اختلاف"}`);
+console.log(`\n✅ تمام: ${local.toLocaleString("en")} ردیف محلی (از ${total.toLocaleString("en")} ردیفِ خوانده‌شده) در ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+console.log(local >= remoteCount ? "   ✔️ محلی کامل است" : `   ⚠️ کم است (${remoteCount - local} ردیف) — دوباره اجرا کن`);
 db.close();
