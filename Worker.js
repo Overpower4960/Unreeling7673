@@ -1,8 +1,149 @@
 // @ts-nocheck
 // =============================================================================
-// ربات مدیریت پنل — Cloudflare Worker (یک فایل)
-// چند پنل 3X-UI / مشابه را از تلگرام مدیریت می‌کند.
-// این فایل عمومی است؛ نام سرویس، دامنه و اطلاعات مالک داخلش نیست.
+//  X Panel Bot — رباتِ مدیریتِ پنل روی Cloudflare Workers (تک‌فایل)
+//  نسخهٔ سورس: 2026-09-27-f72
+//
+//  ── f72 چرا؟ (۲۰۲۶-۰۹-۲۷) ───────────────────────────────────────────────────
+//   کارفرما: «۳ تا D1 که تاثیری نداره، برگردون به ۱ دیتابیس».
+//   درست است: سقفِ رایگانِ D1 **حساب‌سطح** است (۱۰۰k ردیفِ نوشتن در روز)، پس
+//   شاردهای بیشتر سقف را چندبرابر نمی‌کنند. اندازه‌گیریِ زنده:
+//     • نوشتنِ امروزِ حساب: ۱۹۷٬۰۷۴ (main ۱۲۸٬۱۵۱ · ۲: ۳۴٬۳۷۶ · ۳: ۳۴٬۵۴۷)
+//     • سه شارد **آینهٔ هم**: ۱۱٬۴۲۷ کلیدِ مشترک از ۱۱٬۵۱۴ (اختلاف فقط ۳ کلید)
+//     • با n>1 هر نوشتن یک DELETEِ هم‌راستاسازی هم روی شاردهای دیگر می‌زد
+//   ⇒ این بیلد فقط DB اصلی را زیرِ مسیریاب می‌برد (`SINGLE_DB_ONLY`)،
+//     هم‌راستاسازی/سرریز بی‌اثر می‌شود، و برگشت با یک ثابت ممکن است.
+//
+//  ── f71 چرا؟ (۲۰۲۶-۰۹-۲۷) ───────────────────────────────────────────────────
+//   سنجشِ زنده نشان داد ربات حتی در ساعتِ آرام ~۱۰٬۰۰۰ ردیفِ نوشتن در ساعت
+//   می‌سوزاند (≈۲۴۰٬۰۰۰ در روز، سقفِ رایگان ۱۰۰٬۰۰۰) ⇒ هر روز قطع می‌شود.
+//   سه سوختِ اصلی و کاهنده‌های این بیلد:
+//     ۱) ایندکسِ `expires_at` ⇒ هر درج **۳ ردیف** حساب می‌شد. ایندکس حذف شد
+//        (جاروی قفل‌ها با اسکنِ محدود انجام می‌شود) ⇒ ~۴۰٬۰۰۰ ردیف/روز کمتر.
+//     ۲) `CREATE TABLE/INDEX` در **هر درخواست** (هر درخواست یک Store تازه
+//        می‌سازد) ⇒ حالا یک‌بار در هر ایزوله.
+//     ۳) `setCache` حتی وقتی مقدار عوض نشده بود می‌نوشت ⇒ حالا فقط روی تغییر.
+//   به‌علاوه: کارهای دوره‌ایِ سبکِ کران از «هر دقیقه» به «هر ۳–۱۰ دقیقه»
+//   و `put` با UPSERT (بدونِ حذفِ پنهانِ REPLACE).
+//   ⚠️ انتظارِ واقع‌بینانه: مصرف ~۶۰–۷۰٪ کم می‌شود. برای حاشیهٔ اطمینانِ کامل
+//      با ۲۸۷ کاربر، پلنِ پرداختیِ Workers (۵$/ماه) راهِ قطعی است.
+//
+//  ── f70 چه چیزی را درست کرد؟ (۲۰۲۶-۰۹-۲۷) ───────────────────────────────────
+//   ❗ واقعیتِ اندازه‌گیری‌شده: سقفِ نوشتنِ روزانهٔ D1 در سطحِ **حساب** (نه هر
+//      دیتابیس) اعمال می‌شود؛ در ۲۷ سپتامبر هر سه دیتابیس هم‌زمان نوشتن را رد
+//      کردند («Your account has exceeded D1's free tier daily row write limit»).
+//      نتیجهٔ عملی: قفل گرفته نمی‌شود و ذخیرهٔ تنظیم‌ها انجام نمی‌شود.
+//   ۱) پیامِ راست به‌جای پیامِ گمراه‌کننده: «⛔️ ظرفیتِ ذخیره‌سازیِ امروز پر شده»
+//      به‌جای «⏳ درخواست قبلی هنوز در حال انجام است».
+//   ۲) زبان روی KV ذخیره می‌شود (KV سقفِ نوشتنِ جداگانه دارد) ⇒ تغییرِ زبان
+//      حتی در قطعیِ نوشتنِ D1 کار می‌کند.
+//   ۳) در «حالتِ کمبودِ نوشتن» دیگر هیچ تلاشِ نوشتنی (claim) انجام نمی‌شود.
+//   ۴) کران قفل‌های منقضیِ تلنبارشده را کم‌کم جارو می‌کند (۶٬۸۶۰ ردیفِ زائد).
+//   ⚠️ راهِ قطعیِ عبور از سقف‌ها: پلنِ پرداختیِ Workers (۵$/ماه) یا کم‌کردنِ
+//      مصرف تا زیرِ ۱۰۰٬۰۰۰ ردیفِ نوشتن در روز (f69 این را تا حدِ زیادی کم کرد).
+//
+//  ── f69 چه چیزی را درست کرد؟ (۲۰۲۶-۰۹-۲۷) ───────────────────────────────────
+//   ۱) «ربات کند شده»: مصرفِ هر درخواست کم شد — کشِ حافظه‌ای برای مالک/کلیدِ
+//      وب‌هوک/کلیدِ پوش، حذفِ کارهای «ثبتِ وب‌هوک» از مسیرهای سبک، و تجمیعِ
+//      رویدادهای اینباند (هر ~۴۵ ثانیه یک نوشتن، نه هر رویداد — سقفِ نوشتنِ
+//      روزانهٔ D1 ۱۰۰٬۰۰۰ ردیف است و این مسیر تنها مصرف‌کنندهٔ اصلی بود).
+//      گزارشِ زندهٔ آن روز: ۱۵٬۰۶۹ درخواست با خطای exceededResources و
+//      ۲۳٬۹۵۰ درخواستِ نیمه‌کاره (clientDisconnected) — یعنی هم کندی، هم
+//      «دکمه‌ای که هیچ‌کاری نمی‌کند».
+//   ۲) «زبان انگلیسی می‌کنم، فارسی نمی‌شود»: زبانِ پنل و زبانِ چتِ ادمین
+//      یکی شد؛ دکمهٔ 🇮🇷/🇬🇧 هر دو را با هم عوض می‌کند.
+//   ۳) «دکمهٔ قالب هیچ کاری نمی‌کند»: به‌جای returnِ بی‌صدا، پیامِ روشن؛ و
+//      هیچ دکمه‌ای دیگر بی‌صدا نمی‌میرد (خطا به خودِ کاربر نشان داده می‌شود).
+//   ۴) «مشخصاتِ قالب هم زبان‌آگاه شود»: ۳ گیگ / ۱ روز ⇒ 3 GB / 1 Days.
+//      (نامِ قالب — «روزانه» و… — متنی است که خودت هنگامِ ساختِ قالب وارد
+//      کرده‌ای؛ آن را از «🗑/✏️ ویرایشِ قالب» می‌توانی انگلیسی بگذاری.)
+//  ⚠️ نکتهٔ ظرفیت: سقفِ رایگانِ Workers روزی ۱۰۰٬۰۰۰ درخواست و D1 روزی
+//     ۱۰۰٬۰۰۰ ردیف نوشتن است. با ۲۸۷ کاربرِ ثبت‌شده این سقف پر می‌شود؛
+//     این بیلد مصرف را کم می‌کند ولی برای رشدِ بیشتر، پلنِ پرداختی لازم است.
+//
+//  راهنمای کاملِ تصویری/گام‌به‌گام: فایلِ SETUP.md در همین مخزن.
+//  این هدر خلاصهٔ اجرایی است؛ اگر فقط همین یک فایل را داری، از همین‌جا شروع کن.
+//
+//  ── ۰) چک‌لیستِ سریع ──────────────────────────────────────────────────────────
+//   ۱) سه دیتابیس D1:  xpanel · xpanel-2 · xpanel-3
+//   ۲) یک KV:          XPanelBot  (اختیاری/میراثی)
+//   ۳) ورکر:           ES module + compatibility_flags = ["nodejs_compat"]
+//   ۴) بایندینگ‌ها:     DB→xpanel · XPanelBot→KV
+//                      ⚙️ f72: DB2/DB3 دیگر استفاده نمی‌شوند (سقفِ حساب‌سطح است
+//                      و سه شارد آینهٔ هم بودند). بایندینگ‌ها می‌مانند تا برگشت ساده باشد.
+//   ۵) کرون:           */1 * * * *   (هر دقیقه)
+//   ۶) نصب:            POST /api/install  با {token, ownerId}  ⇒ adminKey
+//   ۷) چک:             GET /health   ·   GET /api/install/status
+//   ۸) کارِ روزمره:     پنل‌های ۳x-ui را از داخلِ ربات اضافه کن (آدرس + توکن API)
+//
+//  ── ۱) چرا سه دیتابیس؟ ──────────────────────────────────────────────────────
+//   سقفِ رایگانِ D1 «برای هر دیتابیس جداست»: روزی ۱۰۰٬۰۰۰ ردیف نوشتن و ۵ میلیون
+//   ردیف خواندن ⇒ سه دیتابیس = ۳۰۰٬۰۰۰ نوشتن در روز. ربات (از f67) خودش وقتی
+//   سقفِ اولی پر شد روی دومی و بعد سومی می‌نویسد و سرِ 00:00 UTC به اولی برمی‌گردد.
+//   (حداکثر ۱۰ دیتابیس در هر حساب.)
+//
+//   ساختِ دیتابیس‌ها:
+//     داشبورد: Storage & Databases → D1 → Create   (سه‌بار)
+//     یا API:
+//       curl -X POST "https://api.cloudflare.com/client/v4/accounts/$ACC/d1/database" \
+//         -H "Authorization: Bearer $CF" -H "Content-Type: application/json" \
+//         -d '{"name":"xpanel-2"}'
+//
+//  ── ۲) ساختِ ورکر و بایندینگ ────────────────────────────────────────────────
+//   الف) داشبورد:  Workers & Pages → Create → Worker → Edit code → کلِ این فایل را
+//        جای‌گذاری کن → Deploy → Settings → Runtime: compatibility_date و nodejs_compat
+//   ب) Wrangler:
+//        name = "panel-bot"          main = "Worker.js"
+//        compatibility_date = "2024-09-01"
+//        compatibility_flags = ["nodejs_compat"]
+//        [[d1_databases]]  binding="DB"   database_id="<UUID1>"
+//        [[d1_databases]]  binding="DB2"  database_id="<UUID2>"
+//        [[d1_databases]]  binding="DB3"  database_id="<UUID3>"
+//        [[kv_namespaces]] binding="XPanelBot"  id="<KV-ID>"
+//        [triggers] crons = ["*/1 * * * *"]
+//   ج) API (چندبخشی): تنها راهِ تغییرِ بایندینگ بدونِ داشبورد ⇒ PUT
+//      /accounts/<acc>/workers/scripts/<script> با multipart شامل
+//      metadata (bindings) + worker.js . نکته: PATCH/PUT روی /settings خطای 10405 می‌دهد.
+//   نام‌های جایگزینِ پذیرفته‌شده: D1/xpanel_db (اول) · DB_2/XPANEL_DB2 · DB_3/XPANEL_DB3 · KV/kv
+//
+//  ── ۳) نصب و اتصالِ تلگرام ──────────────────────────────────────────────────
+//   ربات را از @BotFather بساز و شناسهٔ عددیِ خودت را از @userinfobot بگیر، بعد:
+//     curl -X POST "https://<WORKER-URL>/api/install" -H "Content-Type: application/json" \
+//       -d '{"token":"<BOT-TOKEN>","ownerId":"<OWNER-ID>"}'
+//     ⇒ {"success":true,"webhook":true,"adminKey":"..."}
+//   • adminKey فقط همین یک‌بار برمی‌گردد و برای همهٔ /diag/* لازم است (هدرِ X-Diag-Token).
+//   • وبهوک خودکار روی <WORKER-URL>/webhook با secret_token ثبت می‌شود.
+//   • اگر وبهوک خراب شد: در ربات /repair-webhook یا GET /diag/repair-webhook.
+//   • نصبِ دوباره ممکن نیست (ضدِ تصاحب)؛ برای نصبِ تازه cfg:installed را پاک کن.
+//
+//  ── ۴) چک‌های سلامت و کارِ روزمره ──────────────────────────────────────────
+//     GET  /health                 → وضعیت + codeStamp (نسخهٔ زنده)
+//     GET  /api/install/status      → نصب‌شده یا نه
+//     GET  /diag                    → داشبوردِ تشخیصی (هدرِ X-Diag-Token)
+//     GET  /diag/source             → متنِ کدِ زنده (مقایسهٔ sha256 با لوکال)
+//     POST /diag/deploy             → دیپلویِ نسخهٔ جدید (بایندینگ‌ها حفظ می‌شوند)
+//     POST /diag/gh-backup          → بکاپِ فوری در گیت‌هاب
+//     GET  /diag/repair-webhook     → ثبتِ دوبارهٔ وبهوک
+//   در تلگرام: منوی ربات → «پنل‌ها» ⇒ افزودنِ آدرس + توکنِ API پنل (۳x-ui).
+//   برای کانفیگِ رایگانِ کاربران: ربات عمومی → پنل‌ها و قالب‌ها را علامت بزن.
+//
+//  ── ۵) سقف‌ها، بکاپ و نگهبانِ بودجه ────────────────────────────────────────
+//   • نگهبانِ روزانه: ۱۰۰k نوشتن · ۵M خواندن · ۱۰۰k درخواست (هشدار ۷۰٪، اقتصاد ۸۵٪).
+//   • «حالتِ کمبودِ نوشتن» (f66): با دیدنِ خطای سقف، ۱۵ دقیقه هیچ نوشتنی انجام
+//     نمی‌شود ولی خواندن و پاسخ به کاربر ادامه دارد ⇒ ربات ساکت نمی‌ماند.
+//   • بکاپِ گیت‌هاب: تنظیماتِ ربات → توکنِ GitHub (scope: repo) + نامِ مخزن؛
+//     خودکار ۰۰:۰۷ و ۱۲:۰۷ UTC + دکمهٔ دستی.
+//   • برگشت به نسخهٔ قبل: همان POST /diag/deploy با فایلِ نسخهٔ پیشین.
+//
+//  ── ۶) رفعِ اشکالِ رایج ────────────────────────────────────────────────────
+//   ربات ساکت است        → /health و getWebhookInfo؛ ۵۰۳ یعنی ورکر داشت خطا می‌داد.
+//   D1 write limit       → سقفِ آن دیتابیس پر است ⇒ سرریز به DB2/DB3 یا ریستِ 00:00 UTC.
+//   «مشکلِ ذخیره‌سازی»   → پیامِ جدیدِ f67 (دقیقاً می‌گوید ریشه ذخیره‌سازی است، نه پنل).
+//   «کانفیگ فعالی ندارد» → رفعِ f63 (محافظِ رکورد + فرزندخواندگیِ کرون).
+//
+//  ── ۷) امنیت ──────────────────────────────────────────────────────────────
+//   توکنِ ربات/پنل/کلودفلر در D1 متنِ ساده ذخیره می‌شوند (رمزنگاری فقط رزرو است)
+//   ⇒ دسترسی به D1/KV = دسترسیِ کامل. وبهوک با secret_token محافظت می‌شود و
+//   adminKey فقط یک‌بار در نصب برگردانده می‌شود.
 // =============================================================================
 //
 // راه‌اندازی از صفر تا اجرا
@@ -48,7 +189,13 @@
 
 /** کلید حالت پیش‌نمایش کاربر برای هر ادمین */
 /** مهر نسخهٔ کد — بعد از هر دیپلوی در /diag و /health دیده می‌شود */
-const CODE_STAMP = "2026-09-27-f66";
+const CODE_STAMP = "2026-09-27-f72";
+// ⚙️ f72 — «یک دیتابیس» (تصمیمِ صریحِ کارفرما، ۲۰۲۶-۰۹-۲۷):
+//   سقفِ رایگانِ D1 در سطحِ **حساب** است (۱۰۰k ردیفِ نوشتن در روز برای کلِ حساب)،
+//   پس چند-D1 سقف را چندبرابر نمی‌کند. اندازه‌گیریِ زنده: سه شارد آینهٔ هم بودند
+//   (۱۱٬۴۲۷ کلیدِ مشترک از ۱۱٬۵۱۴) و فقط هزینهٔ «حذفِ هم‌راستاسازی» در هر نوشتن
+//   اضافه می‌کردند. برای برگشت به حالتِ چند-شاردی همین ثابت را `false` کن.
+const SINGLE_DB_ONLY = true;
 const PREVIEW_KEY = (uid) => "preview:" + String(uid);
 /** ایمیل مجازی کانفیگ تستی ادمین (جدا از کاربران واقعی) */
 const PREVIEW_EMAIL = (uid) => "utest" + String(uid);
@@ -1747,6 +1894,19 @@ function noteWriteBlock(why){
   globalThis.__wblockUntil = Date.now() + 15*60000;
   if(!globalThis.__wblockWhy || globalThis.__wblockWhy!==why) globalThis.__wblockWhy = why;
 }
+/** ⚡️ f70: پیامِ درست وقتی سهمیهٔ نوشتنِ روزانهٔ D1 تمام شده (نه «درخواستِ قبلی»).
+ *  شاهدِ میدانی: کاربر دکمهٔ ساخت را می‌زد و «⏳ درخواست قبلی هنوز در حال
+ *  انجام است» می‌گرفت، در حالی‌که قفل هرگز گرفته نمی‌شد (سقفِ نوشتن). */
+function quotaBusyMsg(lang){
+  return L(lang,
+    "⛔️ ظرفیتِ ذخیره‌سازیِ ربات برای امروز پر شده است.\n"+
+    "تا ۰۳:۳۰ بامداد (۰۰:۰۰ UTC) ساخت/ذخیره انجام نمی‌شود؛ بعد از آن خودکار برمی‌گردد.\n"+
+    "مشاهدهٔ کاربران و وضعیت همچنان کار می‌کند.",
+    "⛔️ The bot's daily storage quota is full.\n"+
+    "Creating/saving is paused until 00:00 UTC (03:30 Tehran), then it resumes automatically.\n"+
+    "Viewing users and status keeps working.");
+}
+
 /**
  * f48: خبرِ یک‌بارهٔ پر شدنِ سهمیهٔ نوشتن.
  * ⚠️ عمداً هیچ نوشتنی در D1 ندارد (وگرنه خودش خطا می‌داد) — فقط حافظهٔ ایزوله.
@@ -1922,7 +2082,10 @@ function homeClock() {
   }
 }
 /** نمایش قالب: ۳ گیگ / ۱ روز */
-function fmtPlanQuota(gb, days, lang = "fa") {
+function fmtPlanQuota(gb, days, lang = null) {
+  // ⚡️ f69: پیش‌فرض «زبانِ همین آپدیت» است، نه همیشه فارسی.
+  //    گزارشِ میدانی: «زبان را انگلیسی کردم ولی قالب نوشته ۳ گیگ / ۱ روز».
+  if(lang!=="fa" && lang!=="en") lang = (globalThis.__curLang==="en") ? "en" : "fa";
   const g = Number(gb);
   const d = Number(days);
   const gOk = Number.isFinite(g) && g > 0;
@@ -1933,7 +2096,7 @@ function fmtPlanQuota(gb, days, lang = "fa") {
     return gTxt + " / " + dTxt;
   } else {
     const gTxt = gOk ? ((g % 1 === 0 ? String(Math.round(g)) : String(g)) + " GB") : "Unlimited";
-    const dTxt = dOk ? (String(Math.round(d)) + " Days") : "Unlimited";
+    const dTxt = dOk ? (String(Math.round(d)) + ((Math.round(d)===1)?" Day":" Days")) : "Unlimited";
     return gTxt + " / " + dTxt;
   }
 }
@@ -2744,33 +2907,182 @@ function sweepMemMap(map, isExpired, hardCap) {
 }
 
 // ---- Store (KV) ----
+/* ════════════════ f67: مسیریابِ چند D1 (سرریزِ خودکار) ═══════════════════════
+   ایدهٔ کارفرما: روی کلودفلر چند دیتابیس بسازیم و وقتی سقفِ روزانهٔ اولی پر شد
+   برویم روی دومی (هر دیتابیس سقفِ ۱۰۰٬۰۰۰ نوشتنِ جدا دارد).
+
+   • این کلاس جای `store.db` می‌نشیند و «همان» اینترفیسِ D1 را می‌دهد
+     (`prepare(sql).bind(...).run()/first()/all()`)، پس هیچ‌جای دیگرِ کد عوض نمی‌شود.
+   • نوشتن: از شاردِ فعال شروع؛ خطای سقف ⇒ همان کوئری روی شاردِ بعدی + شاردِ فعال
+     جلو می‌رود (تا ۰۰:۰۰ UTC که همه‌چیز ریست می‌شود).
+   • خواندن: شاردِ فعال، بعد بقیه ⇒ داده‌ای که روی شاردِ قبلی مانده هم پیدا می‌شود.
+   • همه در حافظهٔ ایزوله است ⇒ خودِ مسیریاب هیچ نوشتنی در D1 ندارد.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function _utcDay() { return Math.floor(Date.now() / 86400000); }
+function _shardState() {
+  const day = _utcDay();
+  if (!globalThis.__shard || globalThis.__shard.day !== day) {
+    globalThis.__shard = { day, act: 0, full: new Set() };
+  }
+  return globalThis.__shard;
+}
+function _shardOrder(n) {
+  const st = _shardState();
+  if (st.act >= n) st.act = 0;
+  const order = [];
+  for (let i = 0; i < n; i++) {
+    const k = (st.act + i) % n;
+    if (!st.full.has(k)) order.push(k);
+  }
+  if (!order.length) for (let i = 0; i < n; i++) order.push(i);   // همه پر ⇒ آخرین شانس
+  return order;
+}
+function _shardAdvance(from, n) {
+  const st = _shardState();
+  st.full.add(from);
+  if (st.act === from) st.act = (from + 1) % n;
+}
+class D1Router {
+  constructor(dbs) { this.dbs = dbs; }
+  prepare(sql) { return new RoutedStmt(this, sql); }
+  async exec(sql) {
+    for (const db of this.dbs) { try { return await db.exec(sql); } catch (e) { if (!isQuotaErr(e)) throw e; } }
+  }
+  /** کلیدِ نوشته‌شده را از شکلِ کوئری می‌شناسد (برای هم‌راستاسازی بین شاردها) */
+  _wkey(sql, vals) {
+    const q = String(sql).trim();
+    if (/^INSERT INTO store\s*\(\s*key/i.test(q)) return vals[0];
+    if (/^DELETE FROM store WHERE key=\?/i.test(q)) return vals[0];
+    if (/^UPDATE store SET[\s\S]*WHERE key=\?/i.test(q)) return vals[0];
+    return null;
+  }
+  async _call(sql, vals, kind, extra) {
+    const n = this.dbs.length;
+    if (!n) throw new Error("D1 not bound");
+    const isRead = /^\s*(SELECT|PRAGMA|WITH)/i.test(sql);
+    const order = _shardOrder(n);
+    let lastErr = null;
+    for (const i of order) {
+      try {
+        const st = this.dbs[i].prepare(sql);
+        const b = (vals && vals.length) ? st.bind(...vals) : st;
+        const r = (kind === "run") ? await b.run()
+                : (kind === "all") ? await b.all()
+                : await b.first(extra);
+        if (isRead) {
+          const empty = (r == null) || (kind === "all" && r && Array.isArray(r.results) && r.results.length === 0);
+          if (empty) continue;                       // شاید روی شاردِ دیگر باشد
+        } else if (i !== _shardState().act) {
+          _shardState().act = i;                     // سرریز ⇒ ادامهٔ کار از همین شارد
+        }
+        _missCache.forget(sql, vals);
+        // 🔁 f67: «نوشتنِ هم‌راستا» — نسخهٔ قدیمیِ همین کلید از شاردهای دیگر پاک می‌شود
+        //    تا سرِ روزِ جدید (که فعال به شاردِ اول برمی‌گردد) دادهٔ کهنه خوانده نشود.
+        //    (DELETE روی کلیدِ ناموجود = ۰ ردیفِ نوشته‌شده ⇒ سهمیه مصرف نمی‌کند.)
+        if (!isRead && vals && vals.length && n > 1) {
+          const k0 = this._wkey(sql, vals);
+          if (k0 != null) {
+            const rest = [];
+            for (let j = 0; j < n; j++) {
+              if (j === i) continue;
+              rest.push(this.dbs[j].prepare("DELETE FROM store WHERE key=?").bind(k0).run().catch(() => {}));
+            }
+            await Promise.allSettled(rest);
+          }
+        }
+        return r;
+      } catch (e) {
+        lastErr = e;
+        if (isQuotaErr(e)) { _shardAdvance(i, n); continue; }   // سقفِ این شارد ⇒ بعدی
+        throw e;
+      }
+    }
+    if (isRead) return (kind === "all") ? { success: true, results: [], meta: {} } : null;
+    noteWriteBlock("router:all-full");
+    throw lastErr || new Error("write failed on every D1 shard");
+  }
+}
+/** ریزکشِ «نبودِ کلید» — تا در حالتِ چند‌شاردی، خواندن‌های تکراری شاردها را نپیمایند */
+const _missCache = {
+  m: new Map(),
+  key(sql, vals) { return sql + "|" + JSON.stringify(vals || []); },
+  has(sql, vals) {
+    const k = this.key(sql, vals), e = this.m.get(k);
+    if (!e) return false;
+    if (e.exp <= Date.now()) { this.m.delete(k); return false; }
+    return true;
+  },
+  put(sql, vals) {
+    if (this.m.size > 2000) this.m.clear();
+    this.m.set(this.key(sql, vals), { exp: Date.now() + 3000 });
+  },
+  forget(sql, vals) { this.m.delete(this.key(sql, vals)); },
+};
+class RoutedStmt {
+  constructor(r, sql) { this.r = r; this.sql = sql; this.vals = []; }
+  bind(...args) { this.vals = args; return this; }
+  _hit() { return false; }
+  async run() { return this.r._call(this.sql, this.vals, "run"); }
+  async first(col) { return this.r._call(this.sql, this.vals, "first", col); }
+  async all() { return this.r._call(this.sql, this.vals, "all"); }
+}
 class Store {
   /**
    * Prefer D1 (env.DB) for all persistent state. KV optional as legacy/cache.
    * Binding: D1 database → variable name DB (or D1 / xpanel_db)
    */
-  constructor(kv, db) {
+  constructor(kv, db, db2, db3) {
     this.kv = kv || null;
-    this.db = db || null;
+    // 🧩 f67: اگر بایندینگ‌های DB2/DB3 وصل باشند، همه زیرِ مسیریاب می‌روند و
+    //    سرریزِ خودکار کار می‌کند؛ وگرنه دقیقاً مثل قبل، یک دیتابیس.
+    // ⚙️ f72: کارفرما: «برگردون به ۱ دیتابیس». با SINGLE_DB_ONLY فقط DB اول
+    //    زیرِ مسیریاب می‌رود؛ کدِ چند-شاردی دست‌نخورده باقی می‌ماند (سوییچِ یک‌خطی).
+    const _allDbs = [db, db2, db3].filter(Boolean);
+    this.dbs = SINGLE_DB_ONLY ? _allDbs.slice(0, 1) : _allDbs;
+    this._allDbsCount = _allDbs.length;
+    this.db = this.dbs.length ? new D1Router(this.dbs) : null;
     this._initPromise = null;
   }
 
   async ready() {
     if(!this.db) return false;
+    if(globalThis.__dbReady===true) return true;          // ⚡️ f71
     if(this._initPromise) return this._initPromise;
-    this._initPromise = this._initDb();
+    this._initPromise = this._initDb().then((r)=>{ try{ if(r!==false) globalThis.__dbReady=true; }catch{} return r; });
     return this._initPromise;
   }
 
   async _initDb() {
+    // ⚡️ f71: در هر درخواست یک Store تازه ساخته می‌شود، پس CREATE TABLE/INDEX
+    //    در «هر درخواست» اجرا می‌شد (۸٬۰۰۰ بیانیه در دو ساعتِ آرام!). حالا
+    //    هر ایزوله فقط یک‌بار تلاش می‌کند.
+    if(globalThis.__dbReady===true) return true;
+    // ⚡️ f71: حذفِ ایندکسِ `expires_at` — هزینهٔ هر درج را از ۳ ردیف به ۲ کم
+    //    می‌کند (~۴۰٬۰۰۰ ردیف در روز). این «تغییرِ ساختار» است، نه نوشتنِ ردیف؛
+    //    عمداً بیرون از گاردِ writeBlocked و بی‌صدا انجام می‌شود.
+    if(!globalThis.__idxDropped){
+      globalThis.__idxDropped=true;
+      for(const _d of (this.dbs && this.dbs.length ? this.dbs : [this.db])){
+        try{ if(_d) await _d.prepare("DROP INDEX IF EXISTS idx_store_exp").run(); }catch{}
+      }
+    }
     if(writeBlocked()) return false;   // ⚡️ f66: ساخت‌وسازِ جدول هم یک نوشتن است
     try{
-      await this.db.prepare(
-        "CREATE TABLE IF NOT EXISTS store (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER)"
-      ).run();
-      await this.db.prepare(
-        "CREATE INDEX IF NOT EXISTS idx_store_exp ON store(expires_at)"
-      ).run();
+      // 🧩 f67: جدول باید روی «همهٔ» شاردها ساخته شود، وگرنه شاردِ دوم/سوم هنگام
+      //    سرریز با خطای «no such table» رد می‌شد.
+      for(const _db of (this.dbs && this.dbs.length ? this.dbs : [this.db])){
+        try{
+          await _db.prepare(
+            "CREATE TABLE IF NOT EXISTS store (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER)"
+          ).run();
+          await _db.prepare(
+            // ⚡️ f71: ایندکسِ قدیمی دیگر ساخته نمی‌شود (پایین حذفش می‌کنیم).
+            //    ایندکس `expires_at` در هر درج ۱ ردیفِ اضافه هزینه می‌کرد و
+            //    جاروی قفل‌ها بدونِ آن هم با اسکنِ محدود کار می‌کند.
+            "SELECT 1"
+          ).run();
+        }catch(e){ console.error("shard init", e && e.message); }
+      }
       // one-time migrate critical keys from KV → D1
       // اینجا خطای D1 نباید راه‌اندازی را قطع کند؛ بدترین حالت این است که
       // مهاجرت به دور بعد موکول شود (خودش idempotent است).
@@ -2874,8 +3186,11 @@ class Store {
   async _d1PutRaw(k, val, ttlSec) {
     if(!this.db) throw new Error("D1 not bound");
     const exp = (ttlSec && ttlSec>0) ? (Date.now()+ttlSec*1000) : null;
+    // ⚡️ f71: UPSERT به‌جای INSERT OR REPLACE — REPLACE روی ردیفِ موجود
+    //    حذف+درج می‌کند (۲ عملیات)؛ UPSERT فقط یک به‌روزرسانی است.
     await this.db.prepare(
-      "INSERT OR REPLACE INTO store (key, value, expires_at) VALUES (?, ?, ?)"
+      "INSERT INTO store (key,value,expires_at) VALUES (?,?,?) " +
+      "ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at"
     ).bind(k, val, exp).run();
   }
 
@@ -3036,15 +3351,32 @@ class Store {
 
   async isInstalled() { return (await this.get(KEYS.INSTALLED))==="true"; }
   async getToken() { return this.get(KEYS.BOT_TOKEN); }
-  async getOwnerId() { return this.get(KEYS.OWNER_ID); }
+  async getOwnerId() {
+    // ⚡️ f69: کشِ حافظه‌ای (۶۰ ثانیه). این تابع در هر آپدیت چند بار صدا زده
+    //    می‌شد (isOwner/adminCan/گزارش‌ها) و هر بار یک خواندنِ D1 بود —
+    //    یکی از دلایلِ اصلیِ کندیِ ربات.
+    const _now=Date.now();
+    if(globalThis.__ownerIdV!==undefined && globalThis.__ownerIdV!==null &&
+       (_now-(Number(globalThis.__ownerIdTs)||0))<60000) return globalThis.__ownerIdV;
+    const v=await this.get(KEYS.OWNER_ID);
+    if(v!==undefined && v!==null){ globalThis.__ownerIdV=v; globalThis.__ownerIdTs=_now; }
+    return v;
+  }
   /**
    * کلید مخفی وب‌هوک. تلگرام آن را در هدر X-Telegram-Bot-Api-Secret-Token
    * برمی‌گرداند و فقط درخواست‌هایی که این کلید را دارند معتبرند.
    * اگر وجود نداشته باشد (نصب‌های قدیمی) ساخته و ذخیره می‌شود.
    */
   async getWebhookSecret() {
+    // ⚡️ f69: کشِ ۵ دقیقه‌ای در حافظهٔ ایزوله — این کلید در «هر» آپدیتِ
+    //    تلگرام خوانده می‌شد؛ با پرمخاطب‌شدنِ ربات یعنی هزاران خواندنِ اضافه.
+    const _wsNow=Date.now();
+    if(typeof globalThis.__whSecret==="string" &&
+       (_wsNow-(Number(globalThis.__whSecretAt)||0))<300000) return globalThis.__whSecret;
     let v=await this.get(KEYS.WEBHOOK_SECRET);
-    if(typeof v==="string" && /^[A-Za-z0-9_-]{16,256}$/.test(v)) return v;
+    if(typeof v==="string" && /^[A-Za-z0-9_-]{16,256}$/.test(v)){
+      globalThis.__whSecret=v; globalThis.__whSecretAt=_wsNow; return v;
+    }
     v=randId(48);
     // 🔴 f11 (گزارش — secret بلعیده‌شده): تا persist موفق نشود این secret
     //    «معتبر» نیست. قبلاً خطای ذخیره بلعیده می‌شد و درخواست بعدی secret
@@ -3215,7 +3547,24 @@ class Store {
     }catch{ return null; }
   }
   async setCache(k,v,t) {
-    try{ await this.put("c:"+k,{data:v,exp:Date.now()+t*1000},t+60); }catch{}
+    // ⚡️ f71: اگر مقدارِ کش از قبل همین بوده، نوشتنِ دوباره = ۳ ردیفِ سوخته.
+    //    کش‌های کران (cron:*، notif:*، cleanup:* و…) در بیشترِ دورها تکرارِ
+    //    همان مقدارند؛ حالا فقط وقتی می‌نویسیم که واقعاً عوض شده باشد.
+    try{
+      const key="c:"+k;
+      const sig=JSON.stringify(v);
+      if(!globalThis.__cacheSig) globalThis.__cacheSig=new Map();
+      if(globalThis.__cacheSig.get(key)===sig+":"+t) return;   // بی‌تغییر
+      // مقایسه با مقدارِ ذخیره‌شده (کشِ حافظه‌ایِ خودِ Store، بدونِ نوشتن)
+      let cur=undefined;
+      try{ cur=await this.get(key); }catch{}
+      if(cur && typeof cur==="object" && JSON.stringify(cur.data)===sig){
+        globalThis.__cacheSig.set(key, sig+":"+t);
+        return;
+      }
+      globalThis.__cacheSig.set(key, sig+":"+t);
+      await this.put(key,{data:v,exp:Date.now()+t*1000},t+60);
+    }catch{}
   }
   /**
    * 🔴 f9: claim اتمیک آپدیت وب‌هوک — سه حالت: claimed / seen / error.
@@ -3236,7 +3585,9 @@ class Store {
    */
   async claimUpdate(updateId, ttlSec) {
     const k="lock:proc:upd:"+String(updateId);
-    if(this.db){
+    // ⚡️ f70: در «حالتِ کمبودِ نوشتن» نوشتن بسته است ⇒ اصلاً D1 را نزن
+    //    (نه خطا، نه لاگ، نه ردیفِ زائد). مسیرِ حافظهٔ ایزوله پایین‌تر جواب می‌دهد.
+    if(this.db && !writeBlocked()){
       try{
         await this.ready();
         const tok=randId(20)+":"+Date.now();
@@ -3306,7 +3657,7 @@ class Store {
    */
   async releaseUpdateClaim(updateId, token) {
     const k="lock:proc:upd:"+String(updateId);
-    if(this.db){
+    if(this.db && !writeBlocked()){
       try{
         // 🔴 f16: همان گارد releaseOp — حذفِ بدون مالکیت ممنوع
         if(!token){ console.error("releaseUpdateClaim بدون توکن رد شد", k); return false; }
@@ -3445,8 +3796,37 @@ class Store {
   async invalidate(pid) {
     for(const s of[":clients",":online",":stats",":inbounds"]) await this.del("c:"+pid+s);
   }
-  async getLang() { const r=await this.get(KEYS.LANG); return r||"fa"; }
-  async setLang(l) { await this.put(KEYS.LANG,l); }
+  /** ⚡️ f70: آینهٔ KV برای «زبان» — KV سقفِ نوشتنِ جداگانه دارد، پس وقتی
+   *  سقفِ D1 تمام است هم تغییرِ زبان کاربر ذخیره می‌شود. برای این دو کلیدِ
+   *  خاص، KV **مقدم** است (اگر بایندینگ نباشد، همان D1 مثلِ قبل می‌ماند). */
+  async kvMirrorGet(k){
+    const now=Date.now();
+    if(!globalThis.__kvMir) globalThis.__kvMir=new Map();
+    const c=globalThis.__kvMir.get(k);
+    if(c && (now-c.t)<60000) return c.v;
+    let v=null;
+    try{ if(this.kv){ const raw=await this.kv.get(k,{type:"text"}); if(raw!=null) v=String(raw); } }catch{}
+    globalThis.__kvMir.set(k,{v,t:now});
+    return v;
+  }
+  async kvMirrorPut(k,v){
+    // ⚠️ اینجا «سکوتِ داده» نداریم: خواندنِ همین کلیدها (زبان) از KV انجام می‌شود،
+    //    پس نوشتنِ KV دیده می‌شود — برخلافِ قاعدهٔ عمومیِ این پروژه.
+    let ok=false;
+    try{ if(this.kv){ await this.kv.put(k, String(v)); ok=true; } }catch(e){ console.error("kvMirrorPut", k, e&&e.message); }
+    try{ if(!globalThis.__kvMir) globalThis.__kvMir=new Map(); globalThis.__kvMir.set(k,{v:String(v),t:Date.now()}); }catch{}
+    return ok;
+  }
+  async getLang() {
+    // ⚡️ f70: اول KV (سبک، سقفِ جدا)، بعد D1.
+    try{ const kv=await this.kvMirrorGet("lang:g"); if(kv==="en"||kv==="fa") return kv; }catch{}
+    const r=await this.get(KEYS.LANG); return r||"fa";
+  }
+  async setLang(l) {
+    const v=(l==="en")?"en":"fa";
+    try{ await this.kvMirrorPut("lang:g", v); }catch{}     // ✅ حتی وقتی D1 بسته است
+    try{ await this.put(KEYS.LANG, v); }catch(e){ /* سقفِ D1 — KV انجامش داد */ }
+  }
   async getAdmins() { const r=await this.get(KEYS.ADMINS); if(!r) return []; try{ const v=typeof r==="object"?r:JSON.parse(r); return Array.isArray(v)?v:[]; }catch{ return []; } }
   async saveAdmins(a) { await this.put(KEYS.ADMINS,a); }
   async getPlans() { const r=await this.get(KEYS.PLANS); if(!r) return []; try{ const v=typeof r==="object"?r:JSON.parse(r); return Array.isArray(v)?v:[]; }catch{ return []; } }
@@ -5438,13 +5818,25 @@ async function ibBuildMap(panel, out) {
 // هندلر /ib — همیشه سریع و بی‌خطا برمی‌گردد (خرابی‌اش نباید تونل را تحت تأثیر بگذارد)
 // 🔌 f37: هیچ تماس شبکه‌ای به پنل‌ها نمی‌زند؛ فقط وضعیت همان «هاست» را
 // می‌خواند/می‌نویسد. پس latency کم است و پوش nginx (مهلت ۶ ثانیه) امن می‌ماند.
-async function handleIbEvent(request, url, store) {
+async function handleIbEvent(request, url, store, ctx) {
   const q=url.searchParams;
   const ok=new Response(null,{status:204,headers:{"Cache-Control":"no-store"}});
   try{
-    const secret=await store.getIbSecret();
+    // ⚡️ f69: کشِ حافظه‌ایِ کلید (۶۰ ثانیه). این مسیر پرترافیک‌ترین مسیرِ
+    //    ورکر است (هر اتصال/قطعِ کاربرِ هر پنل = یک درخواست) و پیش‌تر هر
+    //    درخواست یک خواندنِ D1 داشت.
+    let secret=globalThis.__ibSecret;
+    if(!secret || (Date.now()-(Number(globalThis.__ibSecretAt)||0))>60000){
+      secret=await store.getIbSecret();
+      globalThis.__ibSecret=secret; globalThis.__ibSecretAt=Date.now();
+    }
     const given=String(q.get("k")||"");
     if(!secret || !given || !timingSafeEq(given, secret)){
+      // ⚡️ f69: هر کلیدِ غلطی یک خواندن+نوشتنِ D1 داشت؛ اسکنرها/ربات‌های
+      //    اینترنتی می‌توانستند سهمیهٔ روزانه را بسوزانند. حداکثر یک‌بار در
+      //    دقیقه (per isolate) سراغِ D1 می‌رویم.
+      if(Date.now()-(Number(globalThis.__ibBadAt)||0)<60000) return new Response(null,{status:403});
+      globalThis.__ibBadAt=Date.now();
       // 🔴 f42: قبلاً کلیدِ اشتباه/عوض‌شده کاملاً بی‌صدا رد می‌شد و فقط با «نام
       //    اینباند نمی‌آید» فهمیده می‌شد. حالا شمارش می‌شود و حداکثر هر ۵ دقیقه
       //    یک ردیف لاگ می‌گذارد تا در /diag دیده شود.
@@ -5471,22 +5863,79 @@ async function handleIbEvent(request, url, store) {
     const host=ibHostNorm(q.get("h"));
     if(!host) return ok;
     const nowS=Math.floor(Date.now()/1000);
+    // ⚡️ f69: تجمیعِ رویدادها در حافظهٔ ایزوله و نوشتنِ دسته‌ای (هر ~۴۵ ثانیه).
+    //    پیش‌تر هر رویداد یک قفل + یک خواندن + یک نوشتنِ D1 بود؛ با هزاران
+    //    اتصال/قطعِ روزانه این تنها مصرفِ اصلیِ سقفِ نوشتنِ D1 (۱۰۰k ردیف/روز)
+    //    بود. حالا هر هاست در هر پنجره یک ردیف می‌شود.
+    if(globalThis.__ibBuf===undefined) globalThis.__ibBuf=new Map();
+    if(globalThis.__ibFlushAt===undefined) globalThis.__ibFlushAt=nowS+45;
+    let _b=globalThis.__ibBuf.get(host);
+    if(!_b){ _b={ev:0, ips:{}, last:0}; globalThis.__ibBuf.set(host,_b); }
+    _b.ev=Number(_b.ev||0)+1;
+    _b.last=Math.max(Number(_b.last||0), nowS);
+    const _perB=_b.ips[ip]||(_b.ips[ip]={});
+    const _curB=_perB[path]||(_perB[path]=[0,0]);
+    _curB[0]=Math.max(0, Number(_curB[0]||0)+(ev==="open"?1:-1));
+    _curB[1]=nowS;
+    if(nowS>=Number(globalThis.__ibFlushAt||0) || globalThis.__ibBuf.size>24){
+      globalThis.__ibFlushAt=nowS+45;
+      const _fl=ibFlushBuf(store);
+      if(ctx && typeof ctx.waitUntil==="function"){ try{ ctx.waitUntil(_fl.catch(()=>{})); }catch{} }
+      else { try{ await _fl; }catch{} }
+    }
+    return ok;
+  }catch(e){ return ok; }
+}
+
+/** ⚡️ f70: جاروی قفل‌های منقضی.
+ *  شاهد: ۲٬۳۲۹ + ۲٬۲۶۶ + ۲٬۲۶۵ ردیفِ `lock:*` در سه دیتابیس انبار شده بود
+ *  (هر آپدیت یک ردیفِ `lock:proc:upd:<id>` می‌سازد و هیچ‌کس پاکش نمی‌کرد).
+ *  در هر اجرای کران فقط چند ردیف (سقفِ بودجه) و فقط وقتی بودجه سالم است. */
+async function sweepExpiredLocks(store, maxRows){
+  const lim=Math.max(5, Math.min(120, Number(maxRows)||40));
+  const cutoff=Date.now()-3600000;          // کهنه‌تر از یک ساعت
+  let total=0;
+  try{
+    const sql="DELETE FROM store WHERE key IN (SELECT key FROM store WHERE key LIKE 'lock:%' AND expires_at IS NOT NULL AND expires_at < "+cutoff+" LIMIT "+lim+")";
+    for(const _db of (store.dbs && store.dbs.length ? store.dbs : [store.db])){
+      if(!_db) continue;
+      try{ const r=await _db.prepare(sql).run(); total+=Number((r&&r.meta&&r.meta.changes)||0); }
+      catch(e){ if(!isQuotaErr(e)) console.error("sweep locks", e&&e.message); }
+    }
+  }catch(e){}
+  return total;
+}
+
+/** ⚡️ f69: تخلیهٔ پاکتِ رویدادهای اینباند در D1 (هر ~۴۵ ثانیه، نه هر رویداد). */
+async function ibFlushBuf(store){
+  const buf=globalThis.__ibBuf;
+  if(!buf || !buf.size) return;
+  const entries=[...buf.entries()]; buf.clear();
+  const nowS=Math.floor(Date.now()/1000);
+  let done=0;
+  for(const [host,b] of entries){
+    if(done>=12) { /* بقیه در دورِ بعد */ globalThis.__ibBuf.set(host,b); continue; }
     try{
       await store.withLock("ib:lk:h:"+host, 10, async()=>{
         const st=(await store.getIbHostState(host))||{ips:{},ev:0};
         st.ips=st.ips||{};
-        st.ev=Number(st.ev||0)+1;
-        st.last=nowS;
-        const per=st.ips[ip]||(st.ips[ip]={});
-        const cur=per[path]||(per[path]=[0,0]);
-        cur[0]=Math.max(0, Number(cur[0]||0)+(ev==="open"?1:-1));
-        cur[1]=nowS;
+        st.ev=Number(st.ev||0)+Number(b.ev||0);
+        st.last=Math.max(Number(st.last||0), Number(b.last||0));
+        for(const _ip in b.ips){
+          const _per=st.ips[_ip]||(st.ips[_ip]={});
+          for(const _p in b.ips[_ip]){
+            const _src=b.ips[_ip][_p];
+            const _dst=_per[_p]||(_per[_p]=[0,0]);
+            _dst[0]=Math.max(0, Number(_dst[0]||0)+(Number(_src[0])||0));
+            _dst[1]=Math.max(Number(_dst[1]||0), Number(_src[1])||0);
+          }
+        }
         ibPrune(st, nowS);
         await store.putIbHostState(host, st);
       });
-    }catch(e){ /* قفل/شبکه — فقط همین رویداد از دست می‌رود */ }
-    return ok;
-  }catch(e){ return ok; }
+      done++;
+    }catch(e){ /* قفل/شبکه — همین پنجره از دست می‌رود، رویدادهای بعدی می‌آیند */ }
+  }
 }
 
 class Bot {
@@ -5723,16 +6172,22 @@ class Bot {
 
   /** 🌐 f28: زبان هر کاربر عادی — پیش‌فرض فارسی؛ در bot_users[uid].lang ذخیره می‌شود */
   async userLang(uid) {
+    // ⚡️ f70: اول آینهٔ KV (حتی وقتی سقفِ نوشتنِ D1 تمام است کار می‌کند).
+    try{
+      const kv=await this.store.kvMirrorGet("lang:u:"+String(uid));
+      if(kv==="en"||kv==="fa") return kv;
+    }catch{}
     try{
       const u=(await this.store.getBotUsers())[String(uid)];
       return (u && u.lang === "en") ? "en" : "fa";
     }catch{ return "fa"; }
   }
   async setUserLang(uid, lang) {
+    const id=String(uid); const v=(lang==="en")?"en":"fa";
+    try{ await this.store.kvMirrorPut("lang:u:"+id, v); }catch{}
     try{
-      const id=String(uid); const v=(lang==="en")?"en":"fa";
       await this.store.withBotUsersPersistent((m)=>{ const prev=m[id]||{}; m[id]={...prev, id, lang:v}; }, 3);
-    }catch{}
+    }catch{ /* سقفِ D1 — KV انجامش داد */ }
   }
   /**
    * 🗣 f57: خوش‌آمد — **همیشه به زبانِ کاربر**.
@@ -5807,12 +6262,34 @@ class Bot {
     // زبانِ واقعیِ کاربر (انگلیسی) و کیبورد به پیش‌فرضِ فارسی ساخته می‌شد.
     this._ulang = null;
     try{ if(this._uid) this._ulang = await this.userLang(this._uid); }catch{}
+    // 🌐 f69: زبانِ جاریِ این آپدیت برای متن‌های کمکی (مثل مشخصاتِ قالب).
+    globalThis.__curLang = this._ulang || undefined;
     // پرچم را برای همین کاربر مقداردهی کن (کاربران عادی → false)
     try{
       if(this._uid && await this.isRealAdmin(this._uid)) await this.isPreviewMode(this._uid);
     }catch{}
 
-    if(up.callback_query) await this.onCb(up.callback_query);
+    if(up.callback_query) {
+      // ⚡️ f69: اگر پردازشِ یک دکمه خطا بدهد، کاربر باید دلیلش را ببیند
+      //    (پیش‌تر فقط مالک خبردار می‌شد و دکمه برای کاربر «هیچ‌کاری نمی‌کرد»).
+      const _cb=up.callback_query;
+      try{ await this.onCb(_cb); }
+      catch(e){
+        const _emsg=String((e&&e.message)||e||"unknown").slice(0,180);
+        try{ console.error("callback error:", _emsg); }catch{}
+        const _ch=(_cb.message&&_cb.message.chat&&_cb.message.chat.id)||null;
+        const _lg=(this._ulang==="en")?"en":"fa";
+        try{ await this.tg.answer(_cb.id,"⚠️",true); }catch{}
+        if(_ch){
+          try{
+            await this.tg.msg(_ch,
+              L(_lg,"⚠️ این دکمه اجرا نشد. یک‌بار دیگر بزنید؛ اگر تکرار شد به پشتیبانی بگویید.\n<code>",
+                   "⚠️ That button didn't run. Try again; if it repeats, tell support.\n<code>")+
+              esc(_emsg)+"</code>");
+          }catch{}
+        }
+      }
+    }
     else if(up.channel_post) await this.onChannelPost(up.channel_post, false);
     else if(up.edited_channel_post) await this.onChannelPost(up.edited_channel_post, true);
     else if(up.message) {
@@ -7815,7 +8292,12 @@ class Bot {
    *    هرگز نباید اینجا ظاهر شوند.
    */
   async buildDiagReport() {
-    const out = { generatedAt: new Date().toISOString(), version: "diag-2" };
+    const out = { generatedAt: new Date().toISOString(), version: "diag-3" };
+    // ⚡️ f69: حالتِ «زنده» فقط با ?live=1. قبلاً هر گزارش ۱۱ پنل را زنده
+    //    پینگ می‌کرد و کلِ کانال را می‌خواند ⇒ ~۳۰ ثانیه و سوزاندنِ بودجهٔ
+    //    subrequest (رایگان: ۵۰ در هر اجرا)؛ همان چیزی که خودِ عیب‌یابی را
+    //    گران می‌کرد.
+    const _live = !!this._diagLive;
 
     // --- تنظیمات عمومی (بدون شناسهٔ کانال/متن‌های طولانی) ---
     let cfg={};
@@ -7838,7 +8320,8 @@ class Bot {
     if(cfg.forceChannelId){
       const jc = { linkSet: !!String(cfg.forceChannelLink||"").trim() };
       try{
-        const info = await this.joinChatInfo(String(cfg.forceChannelId).trim());
+        const info = _live ? await this.joinChatInfo(String(cfg.forceChannelId).trim()) : {};
+        if(!_live) jc.skipped = "live_off";
         jc.typeDetected = info.type || null;   // channel / supergroup / group
         jc.titleKnown   = !!String(info.title||"").trim();
         // نتوانستن در خواندن چت ⇒ ربات ادمین نیست ⇒ بررسی عضویت هم می‌لنگد
@@ -7895,8 +8378,11 @@ class Bot {
         expiresAt: p.expiresAt || p.expireAt || null,
       };
       try{
-        const chk = await this._publicPanelCanAccept(p, 0, 0);
-        if(chk && chk.reason==="read_fail"){
+        const chk = _live ? await this._publicPanelCanAccept(p, 0, 0) : { reason:"live_off" };
+        if(chk && chk.reason==="live_off"){
+          row.reachable=null; row.skipped="live_off";
+        }
+        else if(chk && chk.reason==="read_fail"){
           row.reachable=false; row.error="read_fail";
           if(chk.error) row.errorDetail=String(chk.error).slice(0,160);
         } else {
@@ -8440,9 +8926,17 @@ class Bot {
         const l=raw?JSON.parse(raw):[];
         pendCount=Array.isArray(l)?l.length:0;
       }catch{}
-      const msg="🚨 *جا برای کاربر جدید نیست*\n" + (reason || "هیچ پنل عمومی‌ای ظرفیت ندارد.") + "\n\n"
+      /* 🧩 f67: هشدار باید «ریشه» را بگوید. پیش‌تر وقتی ذخیره‌سازی پر بود یا قفل
+         گرفته نمی‌شد، همان پیامِ «پنل عمومی اضافه کنید» می‌آمد ⇒ گمراه‌کننده. */
+      const _rz=String(reason||"");
+      const _storage = /write limit|read limit|exceeded D1|D1_ERROR|LOCK_TIMEOUT|storage degraded|BOTUSERS_LOCK|LOCKED/i.test(_rz);
+      const _head = _storage ? "🚨 *کاربر جدید ثبت نشد — مشکلِ ذخیره‌سازی*" : "🚨 *جا برای کاربر جدید نیست*";
+      const _tail = _storage
+        ? "🔧 این مشکلِ ظرفیتِ پنل نیست؛ ذخیره‌سازیِ ربات به سقف خورده یا قفل نشد. ربات خودکار برمی‌گردد (۰۰:۰۰ UTC) — اگر تکرار شد خبر بده."
+        : "لطفاً پنل عمومی جدید اضافه کنید یا سقف را بالا ببرید.";
+      const msg=_head+"\n" + (reason || "هیچ پنل عمومی‌ای ظرفیت ندارد.") + "\n\n"
         + (pendCount>0 ? ("⏳ *"+pendCount+" کاربر در صف انتظار* — به محض آزاد شدن ظرفیت، کرون خودکار می‌سازد.\n") : "")
-        + "\nلطفاً پنل عمومی جدید اضافه کنید یا سقف را بالا ببرید.";
+        + "\n" + _tail;
       // 🔔 تنها پیام صدادار ربات: اگر این را نبینید، کاربر جدید کانفیگ نمی‌گیرد.
       for(const id of ids){ try{ await this.tg.msg(id, msg, {loud:true}); }catch{} }
       await this.store.setCache(wk, true, 600);       // هر دلیل، هر ۱۰ دقیقه
@@ -9445,7 +9939,7 @@ if(active && active.reachable && active.client && !active.expired && !active.not
       return this.editOrSend(chat,mid,L(await this.userLang(uid),"الان طرح فعالی برای دریافت اشتراک وجود ندارد.\nلطفاً کمی بعد دوباره تلاش کنید.","No plans are available right now.\nPlease try again shortly."));
     }
     const lang9=await this.userLang(uid);
-    const rows=plans.map(p=>[btn(p.name+" — "+fmtPlanQuota(p.trafficGB,p.days),"u:plan:"+p.id)]);
+    const rows=plans.map(p=>[btn(p.name+" — "+fmtPlanQuota(p.trafficGB,p.days,lang9),"u:plan:"+p.id)]);
     rows.push([btn(L(lang9,"◀ منو","◀ Menu"),"u:menu")]);
     // ✍️ f28: متن جدید صفحهٔ انتخاب (خواستهٔ میدانی — بولد)
     const text = [
@@ -9472,7 +9966,11 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   async userRefreshConfigSamePanel(chat, mid, uid) {
     const lockOk=await this.store.acquireLock("ucreate:"+uid, 30);
     if(!lockOk){
-      await this.tg.call("sendMessage",{chat_id:chat, text:"⏳ درخواست قبلی هنوز در حال انجام است.", reply_markup:this.ukb()});
+      // ⚡️ f70: همان تفکیکِ بالا — پیامِ راست به‌جای «درخواستِ قبلی».
+      const _lq=(writeBlocked() || isQuotaErr(this.store._lastLockErr||""))
+        ? quotaBusyMsg(await this.userLang(uid))
+        : "⏳ درخواست قبلی هنوز در حال انجام است.";
+      await this.tg.call("sendMessage",{chat_id:chat, text:_lq, reply_markup:this.ukb()});
       return;
     }
     let claimed=null;
@@ -10012,7 +10510,13 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     // 🌐 f41: زبانِ خودِ کاربر — همهٔ پیام‌های این مسیر (ساخت کانفیگ) دوزبانه‌اند.
     const _ul = await this.userLang(uid);
     const lockOk=await this.store.acquireLock("ucreate:"+uid, 30);
-    if(!lockOk) return say(L(_ul,"⏳ درخواست قبلی هنوز در حال انجام است.","⏳ Your previous request is still being processed."));
+    if(!lockOk){
+      // ⚡️ f70: تفکیکِ «قفل دستِ درخواستِ قبلی» از «نوشتنِ بسته/سقفِ پر».
+      //    پیش‌تر هر دو یک پیام داشتند و در قطعیِ سهمیه، کاربر فکر می‌کرد
+      //    درخواستِ قبلی‌اش مانده — در حالی‌که هیچ درخواستی نبود.
+      if(writeBlocked() || isQuotaErr(this.store._lastLockErr||"")) return say(quotaBusyMsg(_ul));
+      return say(L(_ul,"⏳ درخواست قبلی هنوز در حال انجام است.","⏳ Your previous request is still being processed."));
+    }
     // پنلی که ظرفیتش را رزرو کرده‌ایم؛ در هر مسیر خطا باید آزاد شود.
     // بیرون از try تعریف می‌شود تا در catch/finally هم در دسترس باشد.
     let _reservedPanelId=null;
@@ -16160,8 +16664,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const _uL=await this.userLang(this._uid);
     await this.editOrSend(chat,mid,
       "🌐 "+t(lang,"language")+":\n"+
-      L(lang,"• زبانِ *متن‌های پنلِ مدیریت* (همین صفحه‌ها)","• Language of *admin-panel texts* (these pages)")+"\n"+
-      L(lang,"• زبانِ *چتِ خودت*: ","• Language of *your own chat*: ")+(_uL==="en"?"English 🇬🇧":"فارسی 🇮🇷")+"\n"+
+      L(lang,"• زبانِ پنل و چتِ شما با هم عوض می‌شود (دکمه‌های زیر).",
+            "• Panel and your chat language change together (buttons below).")+"\n"+
+      L(lang,"• زبانِ فعلی: ","• Current language: ")+(_uL==="en"?"English 🇬🇧":"فارسی 🇮🇷")+"\n"+
       L(lang,"(کاربرهای عادی زبانِ خودشان را از دکمهٔ 🇬🇧/🇮🇷 در چت عوض می‌کنند)",
             "(Normal users change theirs with the 🇬🇧/🇮🇷 button in chat)"),
       kb([
@@ -16181,9 +16686,19 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     await this.cmdLanguage(chat,mid);
   }
   async setLanguage(chat,mid,lang) {
+    // 🌐 f69: زبانِ پنل و زبانِ چتِ خودِ ادمین «یکی» شد.
+    //    گزارشِ میدانی: «زبان را انگلیسی کردم، هرچه می‌زنم فارسی نمی‌شود» —
+    //    چون دو تنظیمِ جدا وجود داشت (متنِ پنل / متنِ چتِ خودت) و ادمین فقط
+    //    یکی را عوض می‌کرد. حالا دکمهٔ 🇮🇷/🇬🇧 هر دو را با هم ست می‌کند.
     await this.store.setLang(lang);
+    try{
+      const _luid=this._uid||String(chat);
+      await this.setUserLang(_luid, lang);
+      this._ulang=lang;
+    }catch{}
+    globalThis.__curLang=lang;
     try{ await this.addLog("settings","lang="+lang, await this.ownerId()); }catch{}
-    await this.cmdSettings(chat,mid);
+    await this.cmdLanguage(chat,mid);
   }
 
   // ---- Search (req 11) ----
@@ -20624,12 +21139,19 @@ if(active && active.reachable && active.client && !active.expired && !active.not
   }
 
   async onPlanUse(chat,mid,uid,planId) {
-    const lang=await this.lang();
+    const lang=(await this.lang())||"fa";
     const plans=await this.store.getPlans();
     const plan=plans.find(p=>String(p.id)===String(planId));
-    if(!plan) return;
+    // ⚡️ f69: «دکمهٔ قالب را می‌زنم، هیچ اتفاقی نمی‌افتد» — ریشه: اینجا در
+    //    نبودِ قالب بی‌صدا return می‌شد و کاربر هیچ پیامی نمی‌گرفت. حالا
+    //    هر حالتِ خطا یک پیامِ روشن دارد.
+    if(!plan){
+      return this.editOrSend(chat,mid,
+        L(lang,"⚠️ این قالب پیدا نشد (شاید حذف شده). از منو یک‌بار دیگر باز کن.","⚠️ That plan was not found (maybe deleted). Reopen it from the menu."),
+        kb([[btn(L(lang,"📦 قالب‌ها","📦 Plans"),"pub:plans")],[btn(t(lang,"back"),"m:main")]]));
+    }
     const panels=(await this.panelsForUser(this._uid)).filter(p=>p.enabled);
-    if(!panels.length) return this.editOrSend(chat,mid,t(await this.lang(),"no_enabled_panels"),(await this.mainMenu()));
+    if(!panels.length) return this.editOrSend(chat,mid,t(lang,"no_enabled_panels"),(await this.mainMenu()));
     await this.store.setState(String(uid),"plan_create_pick",{plan});
     // reuse create panel select then ask email - store plan in state
         const cfgP=await this.store.getPublicCfg();
@@ -20638,9 +21160,9 @@ if(active && active.reachable && active.client && !active.expired && !active.not
     const pubsP=panels.filter(p=>pubP.size&&pubP.has(String(p.id)));
     const normsP=panels.filter(p=>!(pubP.size&&pubP.has(String(p.id))));
     if(pubsP.length){ rows.push([btn(L(lang,"—— 🌐 عمومی ——","—— 🌐 Public ——"),"noop")]); for(const p of pubsP) rows.push([btn("🌐 "+p.name,"sel_create:"+p.id)]); rows.push([btn(L(lang,"—— سایر ——","—— Other ——"),"noop")]); }
-    for(const p of normsP) rows.push([btn(p.name,"sel_create:"+p.id)]); rows.push([btn(t(await this.lang(),"back"),"m:plan_create")]);
+    for(const p of normsP) rows.push([btn(p.name,"sel_create:"+p.id)]); rows.push([btn(t(lang,"back"),"m:plan_create")]);
     await this.store.setState(String(uid),"plan_create_panel",{plan});
-    await this.editOrSend(chat,mid,"📦 *"+esc(plan.name)+"* — "+t(await this.lang(),"select_panel")+":",kb(rows));
+    await this.editOrSend(chat,mid,"📦 *"+esc(plan.name)+"* — "+t(lang,"select_panel")+":",kb(rows));
   }
 
   async onPlanDel(chat,mid,uid,planId) {
@@ -22521,16 +23043,30 @@ export default {
   async scheduled(event, env) {
     const kv=env.XPanelBot||env.KV||env.kv;
     const db=env.DB||env.D1||env.xpanel_db||null;
-    const store=new Store(kv, db);
+    // 🧩 f67: شاردهای اضافی (DB2/DB3) برای سرریزِ خودکارِ سقفِ روزانه
+    const db2=env.DB2||env.DB_2||env.XPANEL_DB2||null;
+    const db3=env.DB3||env.DB_3||env.XPANEL_DB3||null;
+    const store=new Store(kv, db, db2, db3);
     // f51: حالتِ اقتصادِ ایزوله‌های دیگر را از کش بردار (یک خواندنِ ارزان — وگرنه
     //   یک ایزوله ممکن است ساعت‌ها بعد از روشن‌شدنِ اقتصاد هم کرونِ سنگین بزند)
     try{ await syncEconomy(store); }catch{}
     // f48 (کاهشِ نوشتن): اسکنِ سنگینِ «هشدارِ ۸۰٪» فقط روی دورهای زوج اجرا
     //   می‌شود (هر ۲ دقیقه). ارسالِ صندوقِ هشدارها همچنان هر دقیقه است، پس
     //   پیام‌ها بی‌دلیل عقب نمی‌افتند؛ فقط «جمع‌آوری» نیم‌سریع‌تر می‌شود.
-    let _evenMinute=true;
-    try{ _evenMinute=(new Date(Number(event&&event.scheduledTime)||Date.now()).getUTCMinutes()%2)===0; }catch{}
+    let _evenMinute=true, _tick3=true, _tick5=true, _tick10=true;
+    try{
+      const _m=new Date(Number(event&&event.scheduledTime)||Date.now()).getUTCMinutes();
+      _evenMinute=(_m%2)===0;
+      // ⚡️ f71: کاهشِ سوختِ نوشتن — کارهای دوره‌ای سبک‌تر و کم‌فاصله‌تر اجرا می‌شوند.
+      _tick3=(_m%3)===0; _tick5=(_m%5)===0; _tick10=(_m%10)===0;
+    }catch{}
     try{ await store.ready(); }catch{}
+    // ⚡️ f69: اگر همین ایزوله پاکتِ رویدادِ اینباند دارد، حالا تخلیه شود
+    //    (وگرنه اطلاعاتِ «کاربرِ آنلاین» تا رسیدن رویدادِ بعدی معلق می‌ماند).
+    try{ await ibFlushBuf(store); }catch{}
+    // ⚡️ f70: جاروی قفل‌های کهنه — فقط وقتی «حالتِ اقتصاد/کمبودِ نوشتن» روشن نیست
+    //    (در آن حالت باید هر نوشتنِ ممکن را برای کارهای کاربر نگه داشت).
+    try{ if(!econOn() && !writeBlocked()) await sweepExpiredLocks(store, 40); }catch{}
 
     if(!(await store.isInstalled())) return;
 
@@ -22544,7 +23080,9 @@ export default {
         //    با خطای «Too many subrequests» می‌سوخت و کاربر بی‌پیام می‌ماند).
         try{
           // f48: صندوقِ خالی ⇒ نه قفلی گرفته می‌شود نه نوشتنی (۲ نوشتن/دقیقه صرفه)
-          let _outbox=[]; try{ _outbox=await warn80OutboxRead(store); }catch{ _outbox=[]; }
+          // ⚡️ f71: خواندنِ صندوقِ هشدار ۳ ردیف نوشتن (claim آزادسازی) و
+          //    چند بیانیه در هر دقیقه می‌ساخت. حالا هر ۳ دقیقه یک‌بار.
+          let _outbox=[]; try{ if(_tick3) _outbox=await warn80OutboxRead(store); }catch{ _outbox=[]; }
           const _ft=(_outbox && _outbox.length) ? await store.acquireLock("cron:warn80_flush", 45) : null;
           if(_ft){
             try{
@@ -22660,11 +23198,12 @@ export default {
           // گروه آمار: چرخشی (فقط ۳ پنل در هر اجرا) — سنگین است
           await runLocked("ensure_groups", 3600, () => bot0.ensureAllPanelsStatsGroups());
           // اعلان به کاربران پنل‌های از کار افتاده (حداکثر هر ۳۰ دقیقه)
-          await runLocked("notify_down", 1800, () => bot0.notifyUsersOnDeadPanels({max:8})); // f3: 25→8 — هر پنل یک subrequest؛ سقف invocation حفظ شود
+          await runLocked("notify_down", 3600, () => bot0.notifyUsersOnDeadPanels({max:8}));
           // صفحهٔ خانه را همان‌جا ویرایش کن (پیام جدید نفرست)
-          await runLocked("home_refresh", 180, () => bot0.refreshLiveHomes()); // f3: 60→180 — خانهٔ زنده هر ۳ دقیقه تازه شود، نه هر دور
+          // ⚡️ f71: TTLِ بالاتر = نوشتنِ کمتر (هر اجرا چند ردیف می‌نویسد)
+          await runLocked("home_refresh", 600, () => bot0.refreshLiveHomes());
           // 🔌 f35: کش «هاست اینباند ← پنل» چرخشی تازه شود (برای تشخیص پنل در /ib)
-          await runLocked("ib_hosts", 600, () => ibWarmHosts(store, null, 3));
+          await runLocked("ib_hosts", 900, () => ibWarmHosts(store, null, 3));
         }
 
         }catch(e){ console.error("heavy crons", e&&e.message); }
@@ -23729,7 +24268,9 @@ export default {
     const url=new URL(request.url);
     const kv=env.XPanelBot||env.KV||env.kv;
     const db=env.DB||env.D1||env.xpanel_db||null;
-    const store=new Store(kv, db);
+    const db2=env.DB2||env.DB_2||env.XPANEL_DB2||null;      // 🧩 f67
+    const db3=env.DB3||env.DB_3||env.XPANEL_DB3||null;      // 🧩 f67
+    const store=new Store(kv, db, db2, db3);
     try{ await store.ready(); }catch{}
 
     // 🔌 f34: رویداد اینباند از nginx پنل (باز/بسته شدن تونل) — بدون وب‌هوک و بدون لاگ
@@ -23738,15 +24279,23 @@ export default {
     // ---- Auto Webhook Registration ----
     // Register if never done; also re-check daily (helps after CF deploy)
     const webhookUrl = url.origin + "/webhook";
-    const token = await store.getToken();
+    // ⚡️ f69: مسیرهای پرترافیک/بی‌ربط (پایشِ سلامت، رویدادهای اینباند،
+    //    صفحهٔ اشتراک و عیب‌یابی) نباید برای «ثبتِ وب‌هوک» هزینهٔ خواندنِ D1
+    //    بدهند. قبلاً «هر» درخواست در کلِ ورکر یک خواندنِ توکن + خواندنِ
+    //    پرچم داشت — همان چیزی که کندی و سقفِ درخواست را می‌ساخت.
+    const _lightReq = url.pathname==="/health" || url.pathname==="/ib" ||
+      url.pathname==="/sub" || url.pathname.startsWith("/sub/") || url.pathname.startsWith("/diag");
+    const token = _lightReq ? null : await store.getToken();
     let forceWh=false;
-    try{
-      const flag=await store.get(KEYS.WEBHOOK_INITIALIZED);
-      if(flag!=="true") forceWh=true;
-    }catch{ forceWh=true; }
+    if(!_lightReq){
+      try{
+        const flag=await store.get(KEYS.WEBHOOK_INITIALIZED);
+        if(flag!=="true") forceWh=true;
+      }catch{ forceWh=true; }
+    }
     // این دو کار روی هر آپدیت وب‌هوک لازم نیستند (هر پیام = چند عملیات D1 اضافه).
     // فقط برای مسیرهای غیر-وب‌هوک — یا وقتی هنوز ثبت نشده (forceWh).
-    if(url.pathname!=="/webhook" || forceWh){
+    if(!_lightReq && (url.pathname!=="/webhook" || forceWh)){
       await ensureWebhookRegistered(store, token, webhookUrl, forceWh);
       // ✍️ f56: قبلاً این خط به‌ازای **هر درخواستِ غیرِ وب‌هوک** یک ردیف D1 می‌نوشت
       //    (در نظارتِ زنده ≈۲۹ نوشتن در ۱۲ دقیقه). حالا فقط اگر آدرس واقعاً عوض شده.
@@ -23840,7 +24389,16 @@ export default {
       //   خواندن/نوشتنِ D1 پر است. قبلاً یک خطای ذخیره‌سازی همین‌جا هم
       //   می‌توانست ۵۰۰ بدهد و آن‌وقت هیچ راهِ عیب‌یابی نمی‌ماند.
       let installed=null, degraded="";
-      try{ installed=await store.isInstalled(); }
+      try{
+        // ⚡️ f69: کشِ ۶۰ ثانیه‌ای — پایشگرها این مسیر را مرتب می‌زنند و هر
+        //    ضربه یک خواندنِ D1 بود.
+        if(globalThis.__instV!==undefined && (Date.now()-(Number(globalThis.__instAt)||0))<60000){
+          installed=globalThis.__instV;
+        } else {
+          installed=await store.isInstalled();
+          globalThis.__instV=installed; globalThis.__instAt=Date.now();
+        }
+      }
       catch(e){ degraded=isQuotaErr(e)?"quota":(isStorageErr(e)?"storage":"error"); }
       return jsonRes({status:"ok",installed:(installed===true),storage:db?"D1":(kv?"KV":"none"),
                       degraded:degraded||undefined,codeStamp:CODE_STAMP,ts:new Date().toISOString()});
@@ -24400,6 +24958,7 @@ export default {
 
         const token0=await store.getToken();
         const bot0=new Bot(store, token0, ctx);
+        bot0._diagLive = url.searchParams.get("live")==="1";   // ⚡️ f69
         const report=await bot0.buildDiagReport();
         report.tokenInfo={
           hitsUsed: bumped.hits,
