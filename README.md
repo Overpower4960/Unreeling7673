@@ -1,5 +1,21 @@
 # 🚂 xpanel-railway — نسخهٔ ریلویِ ربات (۰ تا ۱۰۰)
 
+## ✅ وضعیتِ زندهٔ این نسخه (۲۰۲۶-۰۹-۲۷، ۱۸:۰۰Z)
+| مورد | مقدار |
+|---|---|
+| آدرسِ عمومی | `https://xpanel-production-3bb5.up.railway.app` |
+| سلامت | `/health` ⇒ `{"status":"ok","codeStamp":"2026-09-27-f72"}` |
+| پروژهٔ ریلوی | `xpanel` · environment `production` · سرویس `xpanel` · والیوم `xpanel-volume` روی `/data` |
+| اکانت | workspace **fernlike4691's Projects** (توکن در `tokens.env` → `RAILWAY_TOKEN`) |
+| داده | ۱۱٬۵۱۰ ردیف (از D1 کلودفلر، هنگامِ بوتِ اول خودکار ری‌استور شد) |
+| وبهوکِ تلگرام | روی همین دامنه ثبت شده؛ کرونِ کلودفلر **خاموش** (یدک) |
+| بکاپ | هر ۶ ساعت + قبل از هر ری‌استارت ⇒ `backups/latest.db.gz` در همین ریپو + ۶ نسخه روی والیوم |
+| دیپلویِ دوباره | `cd xpanel-railway && RAILWAY_API_TOKEN=… railway up --detach -y` |
+| ری‌استارت/رول‌بک | `railway redeploy` · `railway down` (حذفِ دیپلویِ آخر) |
+
+> ⚠️ برای CLI همیشه `RAILWAY_API_TOKEN` بده و `RAILWAY_TOKEN` را unset کن (وگرنه «Unauthorized» می‌دهد):
+> `env -u RAILWAY_TOKEN RAILWAY_API_TOKEN=$RAILWAY_TOKEN railway up --detach -y`
+
 > همان `Worker.js` (نسخهٔ زندهٔ `f72`)، فقط اجراکننده‌اش عوض شده: **Node + SQLite روی ریلوی** به‌جای Cloudflare Workers + D1.
 > نتیجهٔ عملی: **دیگر سقفِ ۱۰۰٬۰۰۰ ردیفِ نوشتنِ روزانه وجود ندارد** — نه ریستِ نیمه‌شب، نه «ربات خاموش شد».
 
