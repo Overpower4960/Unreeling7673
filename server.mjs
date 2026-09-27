@@ -252,7 +252,19 @@ function storePut(key, value) {
 const server = createServer(async (req, res) => {
   const started = Date.now();
   try {
-    const url = `http://${req.headers.host || "localhost"}${req.url}`;
+    // ⚙️ رفعِ باگ: پروکسیِ ریلوی درخواست را با http می‌رساند؛ اگر آدرسِ داخلی را
+    //    http بسازیم، کدِ ربات origin را http:// می‌بیند و ثبتِ وبهوکِ تلگرام
+    //    شکست می‌خورد (تلگرام فقط https را برای وبهوک می‌پذیرد) و بدتر: وبهوک
+    //    پاک می‌شد ⇒ ربات خاموش می‌شد. حالا پروتکلِ واقعی از x-forwarded-proto
+    //    (یا PUBLIC_URL) خوانده می‌شود.
+    //    نکته: URL.protocol شاملِ «:» است ⇒ باید حذف شود وگرنه «https:://…» بی‌اعتبار می‌شود.
+    let proto = "https";
+    try {
+      if (process.env.PUBLIC_URL) proto = new URL(process.env.PUBLIC_URL).protocol.replace(/:$/, "");
+      else proto = (String(req.headers["x-forwarded-proto"] || "https").split(",")[0].trim() || "https").replace(/:$/, "");
+    } catch { proto = "https"; }
+    if (!/^https?$/.test(proto)) proto = "https";
+    const url = `${proto}://${req.headers.host || "localhost"}${req.url}`;
     const path = new URL(url).pathname;
 
     if (path.startsWith("/admin/")) {
